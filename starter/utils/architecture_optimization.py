@@ -17,6 +17,7 @@ Key optimization strategies:
 """
 
 import copy
+import math
 from typing import Any, Dict, List, Optional, Type
 
 import torch
@@ -57,10 +58,20 @@ def create_optimized_model(base_model: nn.Module, optimizations: Dict[str, Any])
   
     print("Starting clinical model optimization pipeline...")
     
-    # TODO: Define the optimization order by filling in this list
-    # HINT: Consider which optimizations should be applied first and why
-    # Think about: architectural changes → layer modifications → hardware opts → parameter opts
-    optimization_order = []  # Add your code here 
+    # Define a sensible, dependency‑aware optimization order
+    # 1) Architectural changes that impact tensor shapes (interpolation/native input)
+    # 2) Layer substitutions that change compute patterns (depthwise/grouped)
+    # 3) Light hardware-aware tweaks (channels_last / in-place activations)
+    # 4) Parameter-space reductions (low-rank, sharing)
+    optimization_order = [
+        'interpolation_removal',
+        'depthwise_separable',
+        'grouped_conv',
+        'channel_optimization',
+        'lowrank_factorization',
+        'parameter_sharing',
+        'inverted_residuals',  # optional; placed last due to larger structural change
+    ]
     
     # Optimization function mapping - connects optimization names to their implementation
     # IMPORTANT: Make sure to experiment with different input parameters for each optimization function, if performance is suboptimal
@@ -138,7 +149,23 @@ def apply_interpolation_removal_optimization(model: nn.Module, native_size: int 
     #
     # See the ResNetBaseline.forward() method to understand how interpolation currently works.
 
-    # Add your code here
+    # Simple and robust approach for the provided ResNetBaseline wrapper:
+    # - If the model exposes `target_size` (see utils/model.py), align it to the
+    #   stored `input_size` or the provided `native_size` so that the internal
+    #   forward() no longer upsamples to 224x224.
+    # - Keep convolutional stem unchanged to avoid weight‑shape mismatches; ResNet
+    #   is fully convolutional and supports smaller inputs.
+    if hasattr(optimized_model, 'target_size'):
+        try:
+            # Prefer the model's own recorded input size if available
+            desired = getattr(optimized_model, 'input_size', native_size) or native_size
+            optimized_model.target_size = int(desired)
+        except Exception:
+            optimized_model.target_size = int(native_size)
+    else:
+        # As a generic fallback, attach metadata – downstream code can honor this
+        setattr(optimized_model, 'target_size', int(native_size))
+        setattr(optimized_model, 'input_size', int(native_size))
 
     # Report optimization status and provide deployment guidance
     print("INTERPOLATION REMOVAL completed.")
@@ -197,7 +224,58 @@ def apply_depthwise_separable_optimization(
     # Also, think about how the residuals are handled.
     # See https://www.paepper.com/blog/posts/depthwise-separable-convolutions-in-pytorch/ for an intuitive explanation and code template.
 
-    # Add your code here
+    class DepthwisePointwise(nn.Module):
+        def __init__(self, in_ch: int, out_ch: int, k: int, s: int, p: int, bias: bool):
+            super().__init__()
+            self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size=k, stride=s,
+                                       padding=p, groups=in_ch, bias=False)
+            # Keep batchnorm/activation outside to respect original BasicBlock order
+            self.pointwise = nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=1,
+                                       padding=0, bias=bias)
+
+        def forward(self, x):
+            x = self.depthwise(x)
+            x = self.pointwise(x)
+            return x
+
+    for name, module in optimized_model.named_modules():
+        # Only consider leaf Conv2d modules
+        if isinstance(module, nn.Conv2d):
+            # Skip pointwise or grouped/depthwise convs; only convert spatial kernels
+            k = module.kernel_size[0]
+            if k <= 1 or module.groups != 1:
+                continue
+            if module.in_channels < min_channels or module.out_channels < min_channels:
+                continue
+
+            # Respect optional filtering by names
+            if layer_names is not None and name not in layer_names:
+                continue
+
+            # Prepare replacement
+            depthwise_pointwise = DepthwisePointwise(
+                in_ch=module.in_channels,
+                out_ch=module.out_channels,
+                k=module.kernel_size[0],
+                s=module.stride[0],
+                p=module.padding[0],
+                bias=module.bias is not None,
+            )
+
+            # Initialize weights with Kaiming norm similar to Conv2d defaults
+            for m in depthwise_pointwise.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
+            # Replace module in parent
+            parent = optimized_model
+            subpath = name.split('.')
+            for p in subpath[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, subpath[-1], depthwise_pointwise)
+            replacements += 1
 
     # Report optimization status
     if replacements > 0:
@@ -256,7 +334,42 @@ def apply_grouped_convolution_optimization(
     # convolutions to each group. To make this happen, you need to ensure that the later is suitable for this transformation.
     # See https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html for how to use the group parameter.
 
-    # Add your code here
+    for name, module in optimized_model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            # Only convert spatial convs with divisible channels
+            if module.kernel_size[0] <= 1 or module.groups != 1:
+                continue
+            if module.in_channels < min_channels or module.out_channels < min_channels:
+                skipped += 1
+                continue
+            if module.in_channels % groups != 0 or module.out_channels % groups != 0:
+                skipped += 1
+                continue
+
+            if layer_names is not None and name not in layer_names:
+                continue
+
+            new_conv = nn.Conv2d(
+                in_channels=module.in_channels,
+                out_channels=module.out_channels,
+                kernel_size=module.kernel_size,
+                stride=module.stride,
+                padding=module.padding,
+                dilation=module.dilation,
+                groups=module.in_channels if do_depthwise else groups,
+                bias=(module.bias is not None),
+                padding_mode=module.padding_mode,
+            )
+            nn.init.kaiming_normal_(new_conv.weight, mode='fan_out', nonlinearity='relu')
+            if new_conv.bias is not None:
+                nn.init.zeros_(new_conv.bias)
+
+            parent = optimized_model
+            subpath = name.split('.')
+            for p in subpath[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, subpath[-1], new_conv)
+            replacements += 1
 
     # Report optimization status and provide deployment tipes
     if replacements > 0:
@@ -371,7 +484,51 @@ def apply_lowrank_factorization(
     # See https://arikpoz.github.io/posts/2025-04-29-low-rank-factorization-in-pytorch-compressing-neural-networks-with-linear-algebra/ 
     # for explanation and code template, and consider how to initialize parameters with respect to the new rank.
 
-    # Add your code here
+    for name, module in optimized_model.named_modules():
+        if isinstance(module, nn.Linear):
+            in_f, out_f = module.in_features, module.out_features
+            params = in_f * out_f
+            if params < min_params:
+                continue
+
+            # Determine rank
+            r = max(1, int(min(in_f, out_f) * rank_ratio))
+
+            # Build low-rank replacement: Linear(in,r) -> Linear(r,out)
+            lr1 = nn.Linear(in_f, r, bias=False)
+            lr2 = nn.Linear(r, out_f, bias=True)
+
+            # Initialize using truncated SVD if possible
+            try:
+                with torch.no_grad():
+                    W = module.weight.data
+                    # Compute economical SVD on CPU to avoid GPU memory overhead
+                    U, S, Vh = torch.linalg.svd(W.cpu(), full_matrices=False)
+                    Ur = U[:, :r]
+                    Sr = torch.diag(S[:r])
+                    Vhr = Vh[:r, :]
+                    lr1.weight.data.copy_((Ur @ Sr).to(lr1.weight.data.dtype))
+                    lr2.weight.data.copy_(Vhr.to(lr2.weight.data.dtype))
+                    if module.bias is not None:
+                        lr2.bias.data.copy_(module.bias.data)
+                    else:
+                        nn.init.zeros_(lr2.bias)
+            except Exception:
+                # Fallback to Kaiming init
+                nn.init.kaiming_uniform_(lr1.weight, a=math.sqrt(5))
+                nn.init.kaiming_uniform_(lr2.weight, a=math.sqrt(5))
+                if lr2.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(lr2.weight)
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(lr2.bias, -bound, bound)
+
+            # Replace in parent
+            parent = optimized_model
+            subpath = name.split('.')
+            for p in subpath[:-1]:
+                parent = getattr(parent, p)
+            setattr(parent, subpath[-1], nn.Sequential(lr1, lr2))
+            replacements += 1
 
     # Report optimization status
     if replacements > 0:
@@ -426,7 +583,20 @@ def apply_channel_optimization(
     # Also, consider ensuring activations are in place by reviewing https://discuss.pytorch.org/t/whats-the-difference-between-nn-relu-and-nn-relu-inplace-true/948/2 
     # for more details.
 
-    # Add your code here
+    # 1) Mark preferred memory format for downstream tensors
+    if enable_channels_last:
+        setattr(optimized_model, 'preferred_memory_format', torch.channels_last)
+
+    # 2) Convert ReLU to in-place where safe
+    if enable_inplace_relu:
+        for name, module in optimized_model.named_modules():
+            if isinstance(module, nn.ReLU) and module.inplace is False:
+                # Replace with in-place variant
+                parent = optimized_model
+                subpath = name.split('.')
+                for p in subpath[:-1]:
+                    parent = getattr(parent, p)
+                setattr(parent, subpath[-1], nn.ReLU(inplace=True))
 
     # Report optimization status
     print("CHANNEL OPTIMIZATION completed")
@@ -487,7 +657,45 @@ def apply_parameter_sharing(
     # See https://stackoverflow.com/questions/57929299/how-to-share-weights-between-modules-in-pytorch 
     # for some inspiration.
 
-    # Add your code here
+    # Build automatic groups if not provided: layers with identical weight shapes
+    from collections import defaultdict
+    shape_groups = defaultdict(list)
+    if sharing_groups is None:
+        for name, module in optimized_model.named_modules():
+            if any(isinstance(module, t) for t in layer_types):
+                w = getattr(module, 'weight', None)
+                if isinstance(w, torch.nn.Parameter):
+                    shape_groups[tuple(w.shape)].append((name, module))
+        # Keep only groups with more than one layer
+        sharing_groups = [[n for n, _ in v] for v in shape_groups.values() if len(v) > 1]
+
+    # Apply sharing within each group
+    for group in sharing_groups or []:
+        if len(group) < 2:
+            continue
+        # Use the first layer as the parameter source
+        src_name = group[0]
+        # Resolve parent and module of the source
+        parent = optimized_model
+        for p in src_name.split('.')[:-1]:
+            parent = getattr(parent, p)
+        src_module = getattr(parent, src_name.split('.')[-1])
+        src_weight = src_module.weight
+        src_bias = getattr(src_module, 'bias', None)
+
+        for tgt_name in group[1:]:
+            tgt_parent = optimized_model
+            for p in tgt_name.split('.')[:-1]:
+                tgt_parent = getattr(tgt_parent, p)
+            tgt_module = getattr(tgt_parent, tgt_name.split('.')[-1])
+            if tgt_module.weight.shape == src_weight.shape:
+                # Point to the same Parameter object
+                tgt_module.weight = src_weight
+                if hasattr(tgt_module, 'bias') and src_bias is not None and tgt_module.bias is not None:
+                    if tgt_module.bias.shape == src_bias.shape:
+                        tgt_module.bias = src_bias
+                total_shared += 1
+                total_parameters_shared += int(src_weight.numel() + (src_bias.numel() if (src_bias is not None and tgt_module.bias is not None) else 0))
    
     # Report optimization status
     if total_shared > 0:
