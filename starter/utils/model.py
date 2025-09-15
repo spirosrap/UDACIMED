@@ -14,6 +14,7 @@ Key features:
 """
 
 from typing import Any, Dict, Optional, Tuple, Union
+import os
 
 import matplotlib.pyplot as plt
 import tqdm
@@ -488,8 +489,14 @@ def train_baseline_model(model: ResNetBaseline, train_loader, val_loader, device
             best_val_acc = val_acc
             patience_counter = 0
             # Save best model for clinical deployment
-            torch.save(model.state_dict(), save_path)
-            print(f"      New best model saved (Val Acc: {val_acc:.1f}%)")
+            try:
+                save_dir = os.path.dirname(save_path)
+                if save_dir:
+                    os.makedirs(save_dir, exist_ok=True)
+                torch.save(model.state_dict(), save_path)
+                print(f"      New best model saved (Val Acc: {val_acc:.1f}%)")
+            except Exception as e:
+                print(f"Warning: Failed to save model to {save_path}: {e} (model not saved)")
         else:
             patience_counter += 1
             if patience_counter >= config['patience']:
@@ -497,8 +504,11 @@ def train_baseline_model(model: ResNetBaseline, train_loader, val_loader, device
                       f"(patience: {config['patience']})")
                 break
     
-    # Load best model for deployment
-    model.load_state_dict(torch.load(save_path))
+    # Load best model for deployment if it was saved successfully
+    if os.path.exists(save_path):
+        model.load_state_dict(torch.load(save_path))
+    else:
+        print(f"Warning: Best model file not found at {save_path}; using in-memory weights.")
     
     print(f"Training completed! Best validation accuracy: {best_val_acc:.2f}%")
     return model, history

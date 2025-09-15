@@ -292,8 +292,45 @@ class PerformanceProfiler:
             >>> memory_results = profiler.profile_memory_usage(model, input_tensor)
             >>> print(f"Peak memory: {memory_results['peak_memory_mb']:.1f} MB")
         """
+        # Provide a CPU fallback so Step 5/6 can still display memory
+        # measurements on machines without CUDA. GPU path remains the
+        # most accurate using CUDA memory stats; CPU path uses process
+        # RSS via psutil as an approximation.
         if not self.is_cuda:
-            return {'error': 'GPU memory profiling only available with CUDA'}
+            try:
+                process = psutil.Process()
+                # Baseline process memory (MB)
+                baseline_memory = process.memory_info().rss / (1024 * 1024)
+
+                model.eval()
+                with torch.no_grad():
+                    _ = call_model(model, input_tensor, self.use_amp)
+                # Current/peak approximation after one forward pass
+                current_memory = process.memory_info().rss / (1024 * 1024)
+                peak_memory = max(baseline_memory, current_memory)
+
+                # Component estimates (model params + input + output)
+                model_memory = sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 * 1024)
+                output = call_model(model, input_tensor, self.use_amp)
+                input_memory = input_tensor.numel() * input_tensor.element_size() / (1024 * 1024)
+                output_memory = output.numel() * output.element_size() / (1024 * 1024)
+                activation_memory = max(0.0, peak_memory - baseline_memory - input_memory)
+
+                return {
+                    'baseline_memory_mb': baseline_memory,
+                    'peak_memory_mb': peak_memory,
+                    'current_memory_mb': current_memory,
+                    'memory_increase_mb': peak_memory - baseline_memory,
+                    'component_breakdown': {
+                        'model_parameters_mb': model_memory,
+                        'input_tensor_mb': input_memory,
+                        'output_tensor_mb': output_memory,
+                        'estimated_activations_mb': activation_memory
+                    },
+                    'note': 'CPU memory measured via process RSS (approximate)'
+                }
+            except Exception as e:
+                return {'error': f'CPU memory profiling failed: {str(e)}'}
         
         try:
             # Reset memory statistics for clean measurement
